@@ -12,9 +12,10 @@ import sklearn
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from keras import Sequential
+from keras.layers import LSTM, Dense, Conv1D, MaxPooling1D
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge
 from xgboost import XGBRegressor
 
 # Bazy danych
@@ -23,7 +24,7 @@ import pymongo
 import datetime # Wymagane do tworzenia timestampów w MongoDB
 
 def save_to_redis(model_name, prediction):
-    """ Zapisuje predykcję do Redis z TTL (Time-to-Live) dla danych bieżących. """
+    """ Zapisuje predykcję do Redis z TTL dla danych bieżących. """
     r.set(f"pred:{model_name}", float(prediction), ex=3600)
 
 def save_snapshot_to_mongo(meta_weights, rf_params, xgb_params):
@@ -57,7 +58,10 @@ print(df.head())
 df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], dayfirst=True)
 df = df.set_index('Datetime')
 
-# Wymuszamy typ numeryczny na wszystkich kolumnach
+# Usuwamy niepotrzebne kolumny tekstowe przed konwersją
+df = df.drop(columns=['Date', 'Time'])
+
+# Wymuszamy typ numeryczny na wszystkich pozostałych kolumnach
 for col in df.columns:
     df[col] = pd.to_numeric(df[col], errors='coerce')
 
@@ -125,10 +129,27 @@ print(top_days[['Global_active_power']])
     4. MongoDB:
        - Przechowuje snapshoty wag modeli oraz aktualne wagi meta-modelu. Dzięki temu system jest w stanie odtwarzać 
          swój stan i przeprowadzać ciągłą analizę regresji w czasie. """
+
+# Czyszczenie danych (usuwamy NaN i uzupełniamy średnią)
+if 'DayOfWeek' in df_resampled.columns:
+    df_resampled = df_resampled.drop(columns=['DayOfWeek'])
+df_resampled = df_resampled.dropna(how='all')
+df_resampled = df_resampled.fillna(df_resampled.mean())
+
+assert not df_resampled.isnull().values.any(), "W danych nadal są NaN! Kod zatrzymany."
+
+# Przygotowanie danych wejściowych
+data_values = df_resampled.select_dtypes(include=[np.number]).values
 scaler = MinMaxScaler()
-data_scaled = scaler.fit_transform(data)
-X = data_scaled[:, :-1]
-y = data_scaled[1:]
+data_scaled = scaler.fit_transform(data_values)
+
+# Podział X i y
+X = data_scaled[:-1, :]
+y = data_scaled[1:, 0]
+
+# Sprawdzamy NaN
+assert not np.isnan(X).any(), "X zawiera NaN po skalowaniu!"
+assert not np.isnan(y).any(), "y zawiera NaN po skalowaniu!"
 
 # Dzielimy na zbiór uczący i testowy
 train_size = int(len(X) * 0.8)
@@ -149,7 +170,10 @@ cases = [
     {'lstm': 128, 'dense': 64}
 ]
 
+# Inicjalizacja
 results = []
+best_model_obj = None
+best_mse = float('inf')
 
 for i, params in enumerate(cases):
     print(f"Testowanie przypadku {i + 1}: LSTM={params['lstm']}, Dense={params['dense']}")
@@ -158,7 +182,7 @@ for i, params in enumerate(cases):
             decyjzę na podstawie wyników Conv1D i LSTM. """
     model = Sequential([
         # Warstwa konwolucyjna wyłapująca lokalne wzorce
-        Conv1D(filters=32, kernel_size=3, activation='relu', input_shape=(X_train.shape[1], X_train.shape[2])),
+        Conv1D(filters=32, kernel_size=3, activation='relu', padding='same', input_shape=(X_train.shape[1], X_train.shape[2])),
         MaxPooling1D(pool_size=2),
 
         # Warstwa LSTM przetwarzająca wyekstrahowane cechy
@@ -180,13 +204,18 @@ for i, params in enumerate(cases):
     results.append({'params': params, 'mse': mse})
     print(f"Wynik MSE: {mse:.4f}")
 
+    if mse < best_mse:
+        best_mse = mse
+        best_model_obj = model
+        best_params = params
+
 # Wybór najlepszego modelu
 best_model = min(results, key=lambda x: x['mse'])
 print(f"Najlepszy model: {best_model['params']} z MSE = {best_model['mse']:.4f}")
 
 # Już mamy najlepszy model do danych sekwencyjnych, teraz do niego dokładamy XGB/RF i ridge do ważenia komu ufać
-crnn_pred_train = best_model.predict(X_train)
-crnn_pred_test = best_model.predict(X_test)
+crnn_pred_train = best_model_obj.predict(X_train)
+crnn_pred_test = best_model_obj.predict(X_test)
 
 # Modele drzewiaste wymagają spłaszczenia X
 X_train_flat = X_train.reshape(X_train.shape[0], -1)
